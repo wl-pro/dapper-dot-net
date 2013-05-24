@@ -378,6 +378,40 @@ namespace SqlMapper
                 .IsSequenceEqualTo(new[] { "a", "b" });
         }
 
+        // see http://stackoverflow.com/questions/16726709/string-format-with-sql-wildcard-causing-dapper-query-to-break
+        public void CheckComplexConcat()
+        {
+            string end_wildcard = @"
+SELECT * FROM #users16726709
+WHERE (first_name LIKE CONCAT(@search_term, '%') OR last_name LIKE CONCAT(@search_term, '%'));";
+
+            string both_wildcards = @"
+SELECT * FROM #users16726709
+WHERE (first_name LIKE CONCAT('%', @search_term, '%') OR last_name LIKE CONCAT('%', @search_term, '%'));";
+
+            string formatted = @"
+SELECT * FROM #users16726709
+WHERE (first_name LIKE {0} OR last_name LIKE {0});";
+
+            string use_end_only = @"CONCAT(@search_term, '%')";
+            string use_both = @"CONCAT('%', @search_term, '%')";
+
+            // if true, slower query due to not being able to use indices, but will allow searching inside strings 
+            bool allow_start_wildcards = false;
+
+            string query = String.Format(formatted, allow_start_wildcards ? use_both : use_end_only);
+            string term = "F"; // the term the user searched for
+
+            connection.Execute(@"create table #users16726709 (first_name varchar(200), last_name varchar(200))
+insert #users16726709 values ('Fred','Bloggs') insert #users16726709 values ('Tony','Farcus') insert #users16726709 values ('Albert','Tenof')");
+
+            // Using Dapper
+            connection.Query(end_wildcard, new { search_term = term }).Count().IsEqualTo(2);
+            connection.Query(both_wildcards, new { search_term = term }).Count().IsEqualTo(3);
+            connection.Query(query, new { search_term = term }).Count().IsEqualTo(2);
+
+        }
+
         enum EnumParam : short
         {
             None, A, B
@@ -555,6 +589,8 @@ namespace SqlMapper
 
             public int _priv;
             private int Priv { set { _priv = value; } }
+
+            private int PrivGet { get { return _priv;} }
         }
 
         public void TestSetInternal()
@@ -567,6 +603,17 @@ namespace SqlMapper
             connection.Query<TestObj>("select 10 as [Priv]").First()._priv.IsEqualTo(10);
         }
 
+
+        public void TestExpandWithNullableFields()
+        {
+            var row = connection.Query("select null A, 2 B").Single();
+            
+            ((int?)row.A)
+                .IsNull();
+
+            ((int?)row.B)
+                .IsEqualTo(2);
+        }
         public void TestEnumeration()
         {
             var en = connection.Query<int>("select 1 as one union all select 2 as one", buffered: false);
@@ -1331,6 +1378,67 @@ end");
             }
         }
 
+        class IntCustomParam : Dapper.SqlMapper.ICustomQueryParameter
+        {
+            IEnumerable<int> numbers;
+            public IntCustomParam(IEnumerable<int> numbers)
+            {
+                this.numbers = numbers;
+            }
+
+            public void AddParameter(IDbCommand command, string name)
+            {
+                var sqlCommand = (SqlCommand)command;
+                sqlCommand.CommandType = CommandType.StoredProcedure;
+
+                List<Microsoft.SqlServer.Server.SqlDataRecord> number_list = new List<Microsoft.SqlServer.Server.SqlDataRecord>();
+
+                // Create an SqlMetaData object that describes our table type.
+                Microsoft.SqlServer.Server.SqlMetaData[] tvp_definition = { new Microsoft.SqlServer.Server.SqlMetaData("n", SqlDbType.Int) };
+
+                foreach (int n in numbers)
+                {
+                    // Create a new record, using the metadata array above.
+                    Microsoft.SqlServer.Server.SqlDataRecord rec = new Microsoft.SqlServer.Server.SqlDataRecord(tvp_definition);
+                    rec.SetInt32(0, n);    // Set the value.
+                    number_list.Add(rec);      // Add it to the list.
+                }
+
+                // Add the table parameter.
+                var p = sqlCommand.Parameters.Add(name, SqlDbType.Structured);
+                p.Direction = ParameterDirection.Input;
+                p.TypeName = "int_list_type";
+                p.Value = number_list;
+            }
+        }
+
+        public void TestTVPWithAnonymousObject()
+        {
+            try
+            {
+                connection.Execute("CREATE TYPE int_list_type AS TABLE (n int NOT NULL PRIMARY KEY)");
+                connection.Execute("CREATE PROC get_ints @integers int_list_type READONLY AS select * from @integers");
+
+                var nums = connection.Query<int>("get_ints", new { integers = new IntCustomParam(new int[] { 1, 2, 3 }) }, commandType: CommandType.StoredProcedure).ToList();
+                nums[0].IsEqualTo(1);
+                nums[1].IsEqualTo(2);
+                nums[2].IsEqualTo(3);
+                nums.Count.IsEqualTo(3);
+
+            }
+            finally
+            {
+                try
+                {
+                    connection.Execute("DROP PROC get_ints");
+                }
+                finally
+                {
+                    connection.Execute("DROP TYPE int_list_type");
+                }
+            }
+        }
+
         class Parent
         {
             public int Id { get; set; }
@@ -2078,6 +2186,38 @@ end");
                 conn.State.IsEqualTo(ConnectionState.Closed);
             }
         }
+        class Multi1
+        {
+            public int Id { get; set; }
+        }
+        class Multi2
+        {
+            public int Id { get; set; }
+        }
+        public void QueryMultimapFromClosed()
+        {
+            using (var conn = GetClosedConnection())
+            {
+                conn.State.IsEqualTo(ConnectionState.Closed);
+                var i = conn.Query<Multi1, Multi2, int>("select 2 as [Id], 3 as [Id]", (x, y) => x.Id + y.Id).Single();
+                conn.State.IsEqualTo(ConnectionState.Closed);
+                i.IsEqualTo(5);
+            }
+        }
+        public void QueryMultiple2FromClosed()
+        {
+            using (var conn = GetClosedConnection())
+            {
+                conn.State.IsEqualTo(ConnectionState.Closed);
+                using (var multi = conn.QueryMultiple("select 1 select 2 select 3"))
+                {
+                    multi.Read<int>().Single().IsEqualTo(1);
+                    multi.Read<int>().Single().IsEqualTo(2);
+                    // not reading 3 is intentional here
+                }
+                conn.State.IsEqualTo(ConnectionState.Closed);
+            }
+        }
         public void ExecuteInvalidFromClosed()
         {
             using (var conn = GetClosedConnection())
@@ -2196,6 +2336,41 @@ end");
             {
                 // pass
             }
+        }
+
+        public void TestIssue131()
+        {
+            var results = connection.Query<dynamic, int, dynamic>(
+                "SELECT 1 Id, 'Mr' Title, 'John' Surname, 4 AddressCount",
+                (person, addressCount) =>
+                {
+                    return person;
+                },
+                splitOn: "AddressCount"
+            ).FirstOrDefault();
+
+            var asDict = (IDictionary<string, object>)results;
+
+            asDict.ContainsKey("Id").IsEqualTo(true);
+            asDict.ContainsKey("Title").IsEqualTo(true);
+            asDict.ContainsKey("Surname").IsEqualTo(true);
+            asDict.ContainsKey("AddressCount").IsEqualTo(false);
+        }
+
+        // see http://stackoverflow.com/questions/13127886/dapper-returns-null-for-singleordefaultdatediff
+        public void TestNullFromInt_NoRows()
+        {
+            var result = connection.Query<int>( // case with rows
+             "select DATEDIFF(day, GETUTCDATE(), @date)", new { date = DateTime.UtcNow.AddDays(20) })
+             .SingleOrDefault();
+            result.IsEqualTo(20);
+
+            result = connection.Query<int>( // case without rows
+                "select DATEDIFF(day, GETUTCDATE(), @date) where 1 = 0", new { date = DateTime.UtcNow.AddDays(20) })
+                .SingleOrDefault();
+            result.IsEqualTo(0); // zero rows; default of int over zero rows is zero
+
+
         }
 
         class TransactedConnection : IDbConnection
